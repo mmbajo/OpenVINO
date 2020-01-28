@@ -24,7 +24,7 @@
 #include <samples/ocv_common.hpp>
 #include <samples/slog.hpp>
 
-#include "object_detection_demo_yolov3_async.hpp"
+#include "open_yolov3.hpp"
 
 #ifdef WITH_EXTENSIONS
 #include <ext_list.hpp>
@@ -180,21 +180,12 @@ int main(int argc, char *argv[]) {
 
         slog::info << "Reading input" << slog::endl;
         cv::VideoCapture cap;
-        if (!((FLAGS_i == "cam") ? cap.open(0) : cap.open(FLAGS_i.c_str()))) {
-            throw std::logic_error("Cannot open input file or camera: " + FLAGS_i);
-        }
+        cv::Mat frame = cv::imread(FLAGS_i.c_str());
 
-        // read input (video) frame
-        cv::Mat frame;  cap >> frame;
-        cv::Mat next_frame;
 
-        const size_t width  = (size_t) cap.get(cv::CAP_PROP_FRAME_WIDTH);
-        const size_t height = (size_t) cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        const size_t width  = (size_t) frame.cols;
+        const size_t height = (size_t) frame.rows;
 
-        if (!cap.grab()) {
-            throw std::logic_error("This demo supports only video (or camera) inputs !!! "
-                                   "Failed to get next frame from the " + FLAGS_i);
-        }
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 1. Load inference engine -------------------------------------
@@ -293,165 +284,100 @@ int main(int argc, char *argv[]) {
         // --------------------------- 6. Doing inference ------------------------------------------------------
         slog::info << "Start inference " << slog::endl;
 
-        bool isLastFrame = false;
-        bool isAsyncMode = false;  // execution is always started using SYNC mode
-        bool isModeChanged = false;  // set to TRUE when execution mode is changed (SYNC<->ASYNC)
-
         typedef std::chrono::duration<double, std::ratio<1, 1000>> ms;
         auto total_t0 = std::chrono::high_resolution_clock::now();
         auto wallclock = std::chrono::high_resolution_clock::now();
         double ocv_decode_time = 0, ocv_render_time = 0;
 
-        std::cout << "To close the application, press 'CTRL+C' here or switch to the output window and press ESC key" << std::endl;
-        std::cout << "To switch between sync/async modes, press TAB key in the output window" << std::endl;
-        // Declare output video
-        cv::Size S = cv::Size((int) cap.get(cv::CAP_PROP_FRAME_WIDTH), (int) cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-        cv::VideoWriter out("out.mp4", cap.get(cv::CAP_PROP_FOURCC), cap.get(cv::CAP_PROP_FPS), S, true);
-        while (true) {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            // Here is the first asynchronous point:
-            // in the Async mode, we capture frame to populate the NEXT infer request
-            // in the regular mode, we capture frame to the CURRENT infer request
-            if (!cap.read(next_frame)) {
-                if (next_frame.empty()) {
-                    isLastFrame = true;  // end of video file
-                } else {
-                    throw std::logic_error("Failed to get frame from cv::VideoCapture");
-                }
-            }
-            if (isAsyncMode) {
-                if (isModeChanged) {
-                    FrameToBlob(frame, async_infer_request_curr, inputName);
-                }
-                if (!isLastFrame) {
-                    FrameToBlob(next_frame, async_infer_request_next, inputName);
-                }
-            } else if (!isModeChanged) {
-                FrameToBlob(frame, async_infer_request_curr, inputName);
-            }
-            auto t1 = std::chrono::high_resolution_clock::now();
-            ocv_decode_time = std::chrono::duration_cast<ms>(t1 - t0).count();
+        // clock it!
+        auto t0 = std::chrono::high_resolution_clock::now();
+        // Here is the first asynchronous point:
+        // in the Async mode, we capture frame to populate the NEXT infer request
+        // in the regular mode, we capture frame to the CURRENT infer request
+        FrameToBlob(frame, async_infer_request_curr, inputName);
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        ocv_decode_time = std::chrono::duration_cast<ms>(t1 - t0).count();
+
+        t0 = std::chrono::high_resolution_clock::now();
+        async_infer_request_curr->StartAsync();
+        // Main sync point:
+        // in the true Async mode, we start the NEXT infer request while waiting for the CURRENT to complete
+        // in the regular mode, we start the CURRENT request and wait for its completion
+
+        if (OK == async_infer_request_curr->Wait(IInferRequest::WaitMode::RESULT_READY)) {
+            t1 = std::chrono::high_resolution_clock::now();
+            ms detection = std::chrono::duration_cast<ms>(t1 - t0);
 
             t0 = std::chrono::high_resolution_clock::now();
-            // Main sync point:
-            // in the true Async mode, we start the NEXT infer request while waiting for the CURRENT to complete
-            // in the regular mode, we start the CURRENT request and wait for its completion
-            if (isAsyncMode) {
-                if (isModeChanged) {
-                    async_infer_request_curr->StartAsync();
-                }
-                if (!isLastFrame) {
-                    async_infer_request_next->StartAsync();
-                }
-            } else if (!isModeChanged) {
-                async_infer_request_curr->StartAsync();
+            ms wall = std::chrono::duration_cast<ms>(t0 - wallclock);
+            wallclock = t0;
+
+            t0 = std::chrono::high_resolution_clock::now();
+            std::ostringstream out;
+            out << "OpenCV cap/render time: " << std::fixed << std::setprecision(2)
+                << (ocv_decode_time + ocv_render_time) << " ms";
+            cv::putText(frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 255, 0));
+            out.str("");
+            out << "Wallclock time " << "(SYNC: ";
+            out << std::fixed << std::setprecision(2) << wall.count() << " ms (" << 1000.f / wall.count() << " fps))";
+            cv::putText(frame, out.str(), cv::Point2f(0, 50), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
+
+
+            // ---------------------------Processing output blobs--------------------------------------------------
+            // Processing results of the CURRENT request
+            const TensorDesc& inputDesc = inputInfo.begin()->second.get()->getTensorDesc();
+            unsigned long resized_im_h = getTensorHeight(inputDesc);
+            unsigned long resized_im_w = getTensorWidth(inputDesc);
+            std::vector<DetectionObject> objects;
+            // Parsing outputs
+            for (auto &output : outputInfo) {
+                auto output_name = output.first;
+                CNNLayerPtr layer = netReader.getNetwork().getLayerByName(output_name.c_str());
+                Blob::Ptr blob = async_infer_request_curr->GetBlob(output_name);
+                ParseYOLOV3Output(layer, blob, resized_im_h, resized_im_w, height, width, FLAGS_t, objects);
             }
-
-            if (OK == async_infer_request_curr->Wait(IInferRequest::WaitMode::RESULT_READY)) {
-                t1 = std::chrono::high_resolution_clock::now();
-                ms detection = std::chrono::duration_cast<ms>(t1 - t0);
-
-                t0 = std::chrono::high_resolution_clock::now();
-                ms wall = std::chrono::duration_cast<ms>(t0 - wallclock);
-                wallclock = t0;
-
-                t0 = std::chrono::high_resolution_clock::now();
-                std::ostringstream out;
-                out << "OpenCV cap/render time: " << std::fixed << std::setprecision(2)
-                    << (ocv_decode_time + ocv_render_time) << " ms";
-                cv::putText(frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 255, 0));
-                out.str("");
-                out << "Wallclock time " << (isAsyncMode ? "(TRUE ASYNC):      " : "(SYNC, press Tab): ");
-                out << std::fixed << std::setprecision(2) << wall.count() << " ms (" << 1000.f / wall.count() << " fps)";
-                cv::putText(frame, out.str(), cv::Point2f(0, 50), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
-                if (!isAsyncMode) {  // In the true async mode, there is no way to measure detection time directly
-                    out.str("");
-                    out << "Detection time  : " << std::fixed << std::setprecision(2) << detection.count()
-                        << " ms ("
-                        << 1000.f / detection.count() << " fps)";
-                    cv::putText(frame, out.str(), cv::Point2f(0, 75), cv::FONT_HERSHEY_TRIPLEX, 0.6,
-                                cv::Scalar(255, 0, 0));
+            // Filtering overlapping boxes
+            std::sort(objects.begin(), objects.end(), std::greater<DetectionObject>());
+            for (size_t i = 0; i < objects.size(); ++i) {
+                if (objects[i].confidence == 0)
+                    continue;
+                for (size_t j = i + 1; j < objects.size(); ++j)
+                    if (IntersectionOverUnion(objects[i], objects[j]) >= FLAGS_iou_t)
+                        objects[j].confidence = 0;
+            }
+            // Drawing boxes
+            for (auto &object : objects) {
+                if (object.confidence < FLAGS_t)
+                    continue;
+                auto label = object.class_id;
+                float confidence = object.confidence;
+                if (FLAGS_r) {
+                    std::cout << "[" << label << "] element, prob = " << confidence <<
+                              "    (" << object.xmin << "," << object.ymin << ")-(" << object.xmax << "," << object.ymax << ")"
+                              << ((confidence > FLAGS_t) ? " WILL BE RENDERED!" : "") << std::endl;
                 }
-
-                // ---------------------------Processing output blobs--------------------------------------------------
-                // Processing results of the CURRENT request
-                const TensorDesc& inputDesc = inputInfo.begin()->second.get()->getTensorDesc();
-                unsigned long resized_im_h = getTensorHeight(inputDesc);
-                unsigned long resized_im_w = getTensorWidth(inputDesc);
-                std::vector<DetectionObject> objects;
-                // Parsing outputs
-                for (auto &output : outputInfo) {
-                    auto output_name = output.first;
-                    CNNLayerPtr layer = netReader.getNetwork().getLayerByName(output_name.c_str());
-                    Blob::Ptr blob = async_infer_request_curr->GetBlob(output_name);
-                    ParseYOLOV3Output(layer, blob, resized_im_h, resized_im_w, height, width, FLAGS_t, objects);
+                if (confidence > FLAGS_t) {
+                    /** Drawing only objects when >confidence_threshold probability **/
+                    std::ostringstream conf;
+                    conf << ":" << std::fixed << std::setprecision(3) << confidence;
+                    cv::putText(frame,
+                            (label < static_cast<int>(labels.size()) ?
+                                    labels[label] : std::string("label #") + std::to_string(label)) + conf.str(),
+                                cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin - 5)), cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
+                                cv::Scalar(0, 0, 255));
+                    cv::rectangle(frame, cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin)),
+                                  cv::Point2f(static_cast<float>(object.xmax), static_cast<float>(object.ymax)), cv::Scalar(0, 0, 255));
                 }
-                // Filtering overlapping boxes
-                std::sort(objects.begin(), objects.end(), std::greater<DetectionObject>());
-                for (size_t i = 0; i < objects.size(); ++i) {
-                    if (objects[i].confidence == 0)
-                        continue;
-                    for (size_t j = i + 1; j < objects.size(); ++j)
-                        if (IntersectionOverUnion(objects[i], objects[j]) >= FLAGS_iou_t)
-                            objects[j].confidence = 0;
-                }
-                // Drawing boxes
-                for (auto &object : objects) {
-                    if (object.confidence < FLAGS_t)
-                        continue;
-                    auto label = object.class_id;
-                    float confidence = object.confidence;
-                    if (FLAGS_r) {
-                        std::cout << "[" << label << "] element, prob = " << confidence <<
-                                  "    (" << object.xmin << "," << object.ymin << ")-(" << object.xmax << "," << object.ymax << ")"
-                                  << ((confidence > FLAGS_t) ? " WILL BE RENDERED!" : "") << std::endl;
-                    }
-                    if (confidence > FLAGS_t) {
-                        /** Drawing only objects when >confidence_threshold probability **/
-                        std::ostringstream conf;
-                        conf << ":" << std::fixed << std::setprecision(3) << confidence;
-                        cv::putText(frame,
-                                (label < static_cast<int>(labels.size()) ?
-                                        labels[label] : std::string("label #") + std::to_string(label)) + conf.str(),
-                                    cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin - 5)), cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
-                                    cv::Scalar(0, 0, 255));
-                        cv::rectangle(frame, cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin)),
-                                      cv::Point2f(static_cast<float>(object.xmax), static_cast<float>(object.ymax)), cv::Scalar(0, 0, 255));
-                    }
-                }
-            }
-            if (!FLAGS_no_show) {
-                out << frame;
-                cv::imshow("Detection results", frame);
-            }
-
-            t1 = std::chrono::high_resolution_clock::now();
-            ocv_render_time = std::chrono::duration_cast<ms>(t1 - t0).count();
-
-            if (isLastFrame) {
-                break;
-            }
-
-            if (isModeChanged) {
-                isModeChanged = false;
-            }
-
-            // Final point:
-            // in the truly Async mode, we swap the NEXT and CURRENT requests for the next iteration
-            frame = next_frame;
-            next_frame = cv::Mat();
-            if (isAsyncMode) {
-                async_infer_request_curr.swap(async_infer_request_next);
-            }
-
-            const int key = cv::waitKey(1);
-            if (27 == key)  // Esc
-                break;
-            if (9 == key) {  // Tab
-                isAsyncMode ^= true;
-                isModeChanged = true;
             }
         }
+
+        cv::imwrite("out.jpg", frame);
+
+
+        t1 = std::chrono::high_resolution_clock::now();
+        ocv_render_time = std::chrono::duration_cast<ms>(t1 - t0).count();
+
         // -----------------------------------------------------------------------------------------------------
         auto total_t1 = std::chrono::high_resolution_clock::now();
         ms total = std::chrono::duration_cast<ms>(total_t1 - total_t0);
