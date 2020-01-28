@@ -1,5 +1,6 @@
 Inference Engine Demos
 ========================
+ADDED: Open_YOLOv3 that takes an image and spits out.. another image with bounding box!! (created by yours truly, mmbajo)
 
 The Open Model Zoo demo applications are console applications that demonstrate how you can use the Inference Engine in your applications to solve specific use-cases.
 
